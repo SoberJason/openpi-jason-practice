@@ -1,0 +1,4 @@
+Step 0: grad_norm=1.5705, loss=0.1146, param_norm=1803.1594
+Step 5: grad_norm=1.3822, loss=0.0900, param_norm=1803.1594
+Step 10: grad_norm=1.3865, loss=0.0881, param_norm=1803.1594
+Step 15: grad_norm=1.2791, loss=0.0824, param_norm=1803.1594
