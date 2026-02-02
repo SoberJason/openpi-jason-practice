@@ -12,6 +12,8 @@ import etils.epath as epath
 import flax.nnx as nnx
 from typing_extensions import override
 import tyro
+import torch
+import numpy as np
 
 import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
@@ -109,6 +111,8 @@ class ModelTransformFactory(GroupFactory):
 
     # If provided, will determine the default prompt that be used by the model.
     default_prompt: str | None = None
+    # ⚠️ 新增: 允许自定义分辨率 (默认 224)
+    image_size: int = 224
 
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
         match model_config.model_type:
@@ -116,7 +120,8 @@ class ModelTransformFactory(GroupFactory):
                 return _transforms.Group(
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
-                        _transforms.ResizeImages(224, 224),
+                        # ⚠️ 修改: 使用 self.image_size
+                        _transforms.ResizeImages(self.image_size, self.image_size),
                         _transforms.TokenizePrompt(
                             _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
                         ),
@@ -459,6 +464,114 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class ConvertToNumpy:
+    def __call__(self, data: dict) -> dict:
+        out = data.copy()
+        if "image" in out:
+            # S1: 确保字典结构可写
+            out["image"] = dict(out["image"])
+            if "image_mask" not in out:
+                out["image_mask"] = {}
+            out["image_mask"] = dict(out["image_mask"])
+
+            # S2: 处理已有的真实图片 (ManiSkill base_camera -> base_0_rgb)
+            # 先缓存一个参考图片用于获取 shape/dtype
+            ref_img = None
+            
+            for k, v in list(out["image"].items()):
+                v = self._convert(v)
+                out["image"][k] = v
+                if ref_img is None: ref_img = v
+                
+                # 真实图片标记为有效
+                if k not in out["image_mask"]:
+                    out["image_mask"][k] = True
+
+            # S3: 补全缺失的 Aloha 摄像头 (Pad with zeros + Mask=False)
+            # Pi0 默认架构依赖这三个特定的 key
+            expected_keys = ["base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"]
+            
+            if ref_img is not None:
+                for k in expected_keys:
+                    if k not in out["image"]:
+                        # 生成全黑占位图 (保持同样的 H, W, C, Dtype)
+                        out["image"][k] = np.zeros_like(ref_img)
+                        # ⚠️ 关键：Mask 设为 False，模型会忽略这个视角的输入
+                        out["image_mask"][k] = False
+
+        return out
+
+    def _convert(self, v):
+        # 1. Tensor -> Numpy
+        if isinstance(v, torch.Tensor):
+            v = v.numpy()
+        
+        # 2. Transpose LeRobot (C, H, W) -> OpenPI (H, W, C)
+        if v.ndim == 3 and v.shape[0] in (1, 3):
+            v = np.transpose(v, (1, 2, 0))
+            
+        # 3. Float32 [0,1] -> Uint8 [0,255]
+        if v.dtype == np.float32 or v.dtype == np.float64:
+            v = (v * 255).clip(0, 255).astype(np.uint8)
+            
+        return v
+
+
+@dataclasses.dataclass(frozen=True)
+class SliceState:
+    """Slices the state vector to the specified dimension."""
+    dim: int = 7
+
+    def __call__(self, data: dict) -> dict:
+        if "state" in data:
+            # Handle both Tensor and Numpy
+            if hasattr(data["state"], "numpy"): # torch tensor
+                 data["state"] = data["state"][..., :self.dim].numpy()
+            else: # numpy array
+                 data["state"] = data["state"][..., :self.dim]
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
+class ManiSkillDataConfig(DataConfigFactory):
+    default_prompt: str | None = None
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "image": {"base_0_rgb": "observation.images.base_camera"},
+                        "state": "observation.state",
+                        "actions": "action",
+                    }
+                ),
+                ConvertToNumpy(),
+                SliceState(dim=7),
+            ]
+        )
+       
+        model_transforms = ModelTransformFactory(
+            default_prompt=self.default_prompt, 
+            image_size=128  # <--- 强制降低分辨率以适应显存
+        )(model_config)
+
+        # 路径处理(强制将 repo_id 转换为绝对路径，确保 LeRobot 能找到本地文件)
+        repo_id = self.repo_id
+        if repo_id and not repo_id.startswith("/") and not repo_id.startswith("gs://"):
+            repo_id = str(pathlib.Path(repo_id).absolute())
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repo_id=repo_id,
+            repack_transforms=repack_transform,
+            model_transforms=model_transforms,
+            action_sequence_keys=("action",),
         )
 
 
@@ -965,6 +1078,63 @@ _CONFIGS = [
         exp_name="debug_pi05",
         wandb_enabled=False,
     ),
+    TrainConfig(
+        name="project_aria",
+        model=pi0_config.Pi0Config(),
+        data=LeRobotAlohaDataConfig(
+            assets=AssetsConfig(asset_id="trossen"),
+        ),
+        policy_metadata={"reset_pose": [0, -1.5, 1.5, 0, 0, 0]},
+    ),
+    
+    # 新增TrainConfig(pi0_maniskill_pickcube), 命名规范：pi0_<数据源>_<任务名>
+    TrainConfig(
+        # 实验目录前缀，也会成为 wandb 的 run name
+        name="pi0_maniskill_pickcube",
+
+        # -------------------- 模型本体 --------------------
+        # 明确使用 LoRA 模型变体
+        # ⚠️ 恢复: 移除 dataclasses.replace 和 proprioception_dim=18
+        # 问题通过 SliceState(dim=7) 在数据层解决
+        model=pi0_config.Pi0Config(
+            action_dim=7, # PickCube-v1 使用 7 维关节位置控制（xArm 7-DOF）
+            paligemma_variant="gemma_2b_lora", # 视觉-语言 backbone 选用 PaliGemma-2B + LoRA，只训 LoRA 参数以节省显存
+            action_expert_variant="gemma_300m_lora", # Action Expert 选用更小的 Gemma-300M + LoRA，负责把 VL 特征解码成 7-D 动作
+        ),
+
+        # -------------------- 参数冻结策略 --------------------
+        # 获取冻结参数的 Filter，只训练 LoRA 权重！
+        # 显式冻结非 LoRA 参数，节省 ~70% 显存
+        # 与上面 model 完全一致，用于生成 freeze_filter
+        # 实际训练时会先调用 get_freeze_filter() 得到哪些参数 trainable / frozen
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora", 
+            action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        
+        # -------------------- EMA（可选） --------------------
+        # LoRA 微调通常不需要 EMA
+        ema_decay=None,
+
+        # -------------------- 数据源配置 --------------------
+        data=ManiSkillDataConfig(
+            repo_id="data/lerobot_datasets/pi0_maniskill_pickcube", # 指向转换好的本地数据集路径
+            assets=AssetsConfig(asset_id="maniskill_pickcube"), # 用于存放 Norm Stats
+            default_prompt="pick up the red cube", # 默认语言指令，当数据集中未提供 prompt 列时回退到该字符串
+        ),
+
+        # -------------------- 训练循环超参 --------------------
+        # 演示用参数，显存不够可把 batch_size 调小
+        # 显存 24 GB 可跑；若 OOM 可降到 2 或 1
+        # 演示用 2000 步即可看 loss 下降；正式实验可调到 50k~100k
+        # 每 500 步存一次 checkpoint（包括 optimizer 状态）
+        # 若同目录已存在 checkpoint，直接覆盖不弹窗询问
+        batch_size=4,
+        num_train_steps=2000,
+        save_interval=500,
+        overwrite=True,
+    ),
+
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),
     *polaris_config.get_polaris_configs(),

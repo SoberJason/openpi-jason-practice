@@ -1,0 +1,185 @@
+Phase2
+核心任务：将 ManiSkill 环境产生的数据，转换成 LeRobot 格式，喂给 OpenPI 训练。
+1、准备 ManiSkill 环境与数据
+1.1、安装 ManiSkill 仿真器
+#使用 uv 安装：可以确保所有依赖版本都被记录在 uv.lock 和 pyproject.toml 中，保证环境的一致性
+uv add mani_skill torch
+1.2、生成/下载演示数据（省去自己手操遥控）
+# 下载 PickCube-v1 的数据
+# 创建存放数据的目录
+mkdir -p data/maniskill
+# 运行下载命令 (ManiSkill 自带工具)
+# 从官方服务器下载预先录制好的演示数据
+# 从HuggingFace下载一个 PickCube-v1.zip，并自动解压到 maniskill 目录下，ManiSkill 的原始数据为.h5 或 .pkl
+# PickCube-v1 是一个经典的机械臂操作任务：让机械臂把一个红色的立方体抓起来。这个任务简单、数据量适中，非常适合作为 Phase 2 的练手任务。
+uv run python -m mani_skill.utils.download_demo "PickCube-v1" -o data/maniskill
+
+2、数据转换
+# ManiSkill 的原始数据(.h5 或 .pkl)，OpenPI 并不直接认识这种格式，只认识LeRobot Dataset 格式，故需要编写一个转换脚本
+2.1、编写脚本（convert_maniskill_to_lerobot.py）读取 ManiSkill 的 .h5 或 .pkl 数据
+# 1. ManiSkill 下载了三种不同来源的数据：
+# 2. motionplanning: 传统运动规划算法生成的数据。
+# 3. rl: 强化学习训练好的策略生成的数据。
+# teleop: 人类遥控生成的数据。
+# 对于 SFT (OpenPI) 训练来说，motionplanning 或者 teleop 的质量通常比 rl 更好（因为 RL 生成的动作可能比较“抖”）。
+# 首选 motionplanning/trajectory.h5，因为它是算法生成的，通常非常稳定且干净
+2.1.1、先打印H5结构
+正在检查轨迹 traj_0 的结构...
+Group: /
+Group: /obs
+Dataset: /actions | Shape: (74, 8) | Type: float32
+Dataset: /terminated | Shape: (74,) | Type: bool
+Dataset: /truncated | Shape: (74,) | Type: bool
+Dataset: /success | Shape: (74,) | Type: bool
+Group: /env_states
+Group: /env_states/actors
+Dataset: /env_states/actors/table-workspace | Shape: (75, 13) | Type: float32
+Dataset: /env_states/actors/cube | Shape: (75, 13) | Type: float32
+Dataset: /env_states/actors/goal_site | Shape: (75, 13) | Type: float32
+Group: /env_states/articulations
+Dataset: /env_states/articulations/panda | Shape: (75, 31) | Type: float32
+Dataset: /rewards | Shape: (74,) | Type: float32
+# 这个 .h5 文件里没有图像 (RGB Images)！注意看 /obs 这个组是空的（或者打印逻辑里没展开它，但看起来它下面没有直接挂载图像数据）。motionplanning 生成的数据通常默认只包含状态 (State) 信息（比如机械臂关节角度、物体坐标），而不包含渲染好的 RGB 图片。
+# OpenPI 的模型（Pi0）是视觉模型，它必须要有图像才能训练。
+2.1.2、录制生成包含图片的H5文件
+# 使用 ManiSkill 自带的回放工具 (Replay Tool)，把这些只有坐标的轨迹，“重放”一遍，并开启相机录制，生成包含图片的 .h5 文件。
+# 采用mani_skill.trajectory.replay_trajectory 模块，一边回放轨迹，一边渲染图片并保存
+# 这一步会比较慢，因为它要渲染 50 条轨迹的每一帧
+# 运行这个命令得到一个新的、体积很大的 .h5 文件 (trajectory.rgb.pd_ee_delta_pose.physx_cpu.h5)
+# 【小插曲】问题：ManiSkill (基于 SAPIEN 引擎) 需要使用 Vulkan 图形接口来渲染图像，但在WSL Linux 环境中找不到能用的 Vulkan 驱动。虽然 Windows 有显卡驱动，但 WSL 里的 Linux 需要安装“桥接”库才能调用它。但即使安装缺失的系统库，Vulkan 依然没有识别到NVIDAI显卡。
+# 解决方案：使用 CPU 软件渲染：强行使用 llvmpipe（这是一种基于 CPU 的软件渲染器）。虽然不是硬件加速，但 llvmpipe 支持 OpenGL/Vulkan 的基础功能。这意味着我们不用修显卡驱动也能跑，只要速度慢一点而已（反正我们只生成 50 条数据，慢点无所谓）。
+# 1. 彻底隐藏 GPU (CUDA_VISIBLE_DEVICES="")
+# 2. 指定软件（CPU，LLVMpipe）渲染配置文件 (VK_ICD_FILENAMES)
+# 3. 指定 Vulkan 设备为 CPU（LIBGL_ALWAYS_SOFTWARE）
+# 4. 明确告诉 ManiSkill 使用 CPU 后端 (--sim-backend cpu)
+CUDA_VISIBLE_DEVICES="" \
+VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json \
+LIBGL_ALWAYS_SOFTWARE=1 \
+uv run python -m mani_skill.trajectory.replay_trajectory \
+  --traj-path data/maniskill/PickCube-v1/motionplanning/trajectory.h5 \
+  --save-traj \
+  --target-control-mode pd_ee_delta_pose \
+  --obs-mode rgb \
+  --count 50 \
+  --sim-backend cpu
+# 【问题联想】WSL 这种驱动环境不完善是啥原因？train.py (JAX/PyTorch) 训练时能爽快地用 GPU，而 mani_skill 画个图却这么难？
+因为 “通用计算 (Compute)” 和 “图形渲染 (Graphics/Rendering)” 是两条完全不同的技术路线。
+1. 计算 (Compute) - 训练模型用这个
+技术栈: CUDA, cuDNN
+WSL 支持情况: 完美。
+微软和 NVIDIA 合作搞了个 DirectX 12 的桥接技术，可以让 WSL 里的 PyTorch/JAX 直接把矩阵计算任务丢给 Windows 宿主机的显卡算。
+所以: 你跑 train.py 时，显卡火力全开，速度很快。
+2. 渲染 (Rendering) - 仿真器画图用这个
+技术栈: OpenGL, Vulkan, EGL
+WSL 支持情况: “半吊子” / 很复杂。
+这就是 ManiSkill 报错的原因。仿真器不仅仅要算“物理位置”（这是计算），还要把这些位置在屏幕上画出来变成 RGB 像素（这是渲染）。
+要想在 WSL 里调用显卡进行 Vulkan 硬件渲染，需要极其复杂的配置（不仅要装驱动，还要配置正确的 ICD Loader，还要保证 WSLg 组件版本匹配）。
+现状: 绝大多数开箱即用的 WSL 环境，只能做计算，不能做硬件渲染。
+结论
+训练模型 (OpenPI): 用 CUDA -> 用显卡 -> 没问题。
+生成数据 (ManiSkill): 用 Vulkan -> 用显卡 -> 报错 -> 只能降级用 CPU 软渲染。
+2.1.3、打印新生成的H5文件
+正在检查轨迹 traj_0 的结构...
+Group: /
+Group: /obs
+Group: /obs/agent
+Dataset: /obs/agent/qpos | Shape: (75, 9) | Type: float32
+Dataset: /obs/agent/qvel | Shape: (75, 9) | Type: float32
+Group: /obs/extra
+Dataset: /obs/extra/is_grasped | Shape: (75,) | Type: bool
+Dataset: /obs/extra/tcp_pose | Shape: (75, 7) | Type: float32
+Dataset: /obs/extra/goal_pos | Shape: (75, 3) | Type: float32
+Group: /obs/sensor_param
+Group: /obs/sensor_param/base_camera
+Dataset: /obs/sensor_param/base_camera/extrinsic_cv | Shape: (75, 3, 4) | Type: float32
+Dataset: /obs/sensor_param/base_camera/cam2world_gl | Shape: (75, 4, 4) | Type: float32
+Dataset: /obs/sensor_param/base_camera/intrinsic_cv | Shape: (75, 3, 3) | Type: float32
+Group: /obs/sensor_data
+Group: /obs/sensor_data/base_camera
+Dataset: /obs/sensor_data/base_camera/rgb | Shape: (75, 128, 128, 3) | Type: uint8
+Dataset: /actions | Shape: (74, 7) | Type: float32
+Dataset: /terminated | Shape: (74,) | Type: bool
+Dataset: /truncated | Shape: (74,) | Type: bool
+Dataset: /success | Shape: (74,) | Type: bool
+Group: /env_states
+Group: /env_states/actors
+Dataset: /env_states/actors/table-workspace | Shape: (75, 13) | Type: float32
+Dataset: /env_states/actors/cube | Shape: (75, 13) | Type: float32
+Dataset: /env_states/actors/goal_site | Shape: (75, 13) | Type: float32
+Group: /env_states/articulations
+Dataset: /env_states/articulations/panda | Shape: (75, 31) | Type: float32
+# Dataset: /obs/sensor_data/base_camera/rgb | Shape: (75, 128, 128, 3)
+# 这行显示你现在终于有了 128x128 的彩色图像数据 (RGB)，这是训练 OpenPI 必不可少的。之前只有坐标没有图，现在有图了。
+2.1.4 编写数据转换脚本（convert_maniskill_to_lerobot.py）
+# 问题1：最新的 LeRobot 库（Version 2.0+）强制要求数据集必须包含一个 task (任务描述) 字段。这是为了支持语言条件模型（Language Conditioned Policies），即告诉机器人“你要干什么”。以前的版本不需要这个字段，但现在它是必须的。
+# 解决方案1：在 features 定义中添加 task 字段（类型为字符串）。在 add_frame 写入数据时，填入任务描述（例如 "pick up the red cube"）。
+# 问题2：这个报错 Missing features: {'task'} 告诉我们：尽管你在 features 参数里没写 task，但你安装的这一版 LeRobot 库会在初始化时强制自动注入 task 特征，并且要求你在写入每一帧时必须提供它。而在之前尝试中，当你手动在 features 里定义 task 时，又因为参数配置不匹配（比如 shape 设置）导致报错。
+# 解决方案2：不需要在 features 定义里显式写 task（避免配置错误），但在 add_frame 塞数据时，必须老老实实把 "task": "..." 塞进去。
+
+2.2、将其转换为 HuggingFace LeRobot Dataset 格式（OpenPI 认识的格式）
+uv run python convert_maniskill_to_lerobot.py
+
+3、接入 OpenPI 配置
+# 数据已经准备就绪（存放在 pi05_maniskill_pickcube），需要告诉 OpenPI 去哪里找这个数据集
+3.1、修改 openpi 的配置文件，注册这个新数据集
+# 根据 config.py 的定义，DataConfig 是通过 DataConfigFactory 生成的。需要针对 ManiSkill 数据集定义一个 Factory，并正确配置“数据重打包 (repack_transforms)”和“模型变换 (model_transforms)”
+# 修改 config.py：定义如何读取 Maniskill 数据（ManiSkillDataConfig）以及注册一个新的训练实验（pi0_maniskill_pickcube）
+# 1. 添加 ManiSkillDataConfig 类定义
+# 2. 在 _CONFIGS 列表中注册新配置TrainConfig(name="pi0_maniskill_pickcube"...)
+
+4、计算 Norm Stats
+# 计算数据的归一化统计量（均值、方差）
+CUDA_VISIBLE_DEVICES="" JAX_PLATFORMS=cpu uv run scripts/compute_norm_stats.py --config-name pi0_maniskill_pickcube
+# Writing stats to: /home/jason/openpi/data/lerobot_datasets/pi05_maniskill_pickcube 的输出表明归一化统计量（Normalization Stats）已经成功计算并保存。这是确保模型能正确理解动作数值范围的关键一步
+
+5、跑通训练流程
+# OpenPI 的图像处理函数（基于 PIL）期望输入是 Numpy 数组，但 LeRobot 数据加载器读出来的是 PyTorch Tensor。我们需要插入一个小转换步骤，把 Tensor 转回 Numpy。添加导入：在文件头部导入 torch。定义转换类：在 ManiSkillDataConfig 前面定义一个 ConvertToNumpy 类。应用转换：在 ManiSkillDataConfig 里调用这个类。
+# LeRobot 与 OpenPI (PIL) 的数据格式不兼容。LeRobot 输出：默认是 (C, H, W) 格式（Channel First），且归一化到了 float32 [0, 1]。OpenPI/PIL 期望：(H, W, C) 格式（Channel Last），且 PIL.Image.fromarray 对 float32 的支持有限，通常期望 uint8 [0, 255] 来处理 RGB 图像。升级 ConvertToNumpy 类，让它承担起“适配器”的角色：转 Numpy + 维度转置 (Transpose) + 类型转换 (Float->Uint8)。添加 Numpy 导入：在文件顶部的 import 区域添加 import numpy as np。升级 ConvertToNumpy 类。
+# OpenPI 默认要求数据中必须包含 image_mask（用来指示哪些图像是有效的，防止缺失摄像头导致的崩溃），但我们的转换脚本和 LeRobot 数据里并没有这个字段。再次升级 ConvertToNumpy 类，让它在转换格式的同时，自动补全 image_mask。
+# 配置不匹配的问题：模型那边：你直接使用了 Pi0Config(action_dim=7)，这个默认配置是针对 Aloha 机器人的，它硬编码了需要 ['base_0_rgb', 'left_wrist_0_rgb', 'right_wrist_0_rgb'] 这三个摄像头。数据那边：你的 ManiSkill 数据集（PickCube）只有一个摄像头 ['base_camera']。冲突：模型试图去读取不存在的 wrist cameras，导致报错。解决方案：在 src/openpi/training/config.py 中，需要修改 Pi0Config 的初始化参数，显式告诉它我们只有这一个摄像头：OpenPI 默认的模型架构“硬编码”了对 Aloha 机器人配置（3个摄像头），为了让单摄像头 ManiSkill 数据适配这个模型，需要采用数据适配模型策略：把 base_camera 重命名为模型期待的主摄像头名字 base_0_rgb，为缺失的两个手腕摄像头（left_wrist_0_rgb, right_wrist_0_rgb）生成全黑的占位图片（关键的一步：将这些占位图片的 image_mask 设为 False。这会明确告诉模型：“这几路信号无效，请在做注意力计算时忽略它们”。这是处理模态缺失的标准做法。）
+# 即便是将 batch_size 降到了 1 依然爆显存 (Resource Exhausted)，这通常意味着两个问题：未正确冻结参数：虽然在命令行指定了 gemma_2b_lora，但如果没有在 TrainConfig 中配置 freeze_filter，训练器会默认尝试计算和存储所有参数（2B+）的梯度和优化器状态（大约需要 16GB+ 显存）。图像输入过大：为了补全 3 个摄像头输入，我们把图像数据量乘以了 3 倍。224x224 的分辨率在这种情况下开销很大。需要修改配置文件，显式开启 LoRA 的参数冻结机制（只训练 <1% 的参数），并顺便降低图像分辨率。（日志里显示 Resizing image ... from (128, 128) to (224, 224)，这说明虽然我们在 DataLoader 里为了省内存降到了 128，但模型（Paligemma）为了兼容预训练权重，在内部又把它放大回了 224。）
+# 维度不匹配的问题：原因分析：数据端：ManiSkill 数据集提供的状态向量 state 长度是 18（从日志 [0].state: (1, 18) 可以看出）。模型端：你的 Pi0Config 并没有配置状态维度，默认可能将其设为了与 Action 维度相同（即 7），导致权重被初始化为 (7, 1024)。冲突：当维度为 18 的数据输入到期望维度为 7 的线性层时，就报了 dot_general 错误。解决方案：显式告诉 Pi0Config，我们的状态维度（proprioception_dim）是 18。
+# ManiSkill 给了 18 维的状态，模型期待 7 维。（ManiSkill 的 18 维状态通常由 [关节角度(7) + 关节速度(7) + 其他信息(4)] 组成。Pi0 模型（以及 Aloha 等基线模型）的设计初衷是只利用关节角度（Proprioception）作为本体感知输入。通过 SliceState(dim=7) 只保留前 7 维，实际上是在做特征筛选：保留了最重要的“关节角度”，丢弃了模型无法处理的“速度”和“末端位姿”。只要数据的前 7 维确实是关节角度（这是标准顺序），哪怕丢弃后面的信息，模型依然可以正常工作。）把 18维的数据切片成 7维 喂给模型即可。修改 config.py ，需要做 2 处修改：1. 新增一个 SliceState类：专门把 state 切片成 7 维。2、在 ManiSkillDataConfig 中使用它：把 state 切片成 7 维。
+# 为什么Wandb显示只有一张图？Libero 数据集录制的时候就开了 5 个头，而现在的 PickCube 数据集录制的时候只开了 1 个头。以下是详细对比：1. Libero 数据集 (之前的 pi05-libero-lora)：Libero 是一个为多视角研究设计的仿真环境，标准配置非常豪华：AgentView (RGB): 机器人正对面的视角。Robot0 EyeInHand (RGB): 机械臂末端手腕视角。有时还包括额外的深度图 (Depth) 或其他角度（如 eye_in_hand_depth, agentview_depth 等）。WandB 的行为：当你跑 Libero 配置时，OpenPI 会把数据集中所有可用的图像键（Keys）都读取出来并拼在一起，所以能看到 5 张甚至更多的图。2. ManiSkill PickCube (你现在的 pi0_maniskill_pickcube) ：这个数据集是一个非常基础的示例数据集，为了节省体积和计算量，LeRobot 版本的 PickCube 默认配置通常很“极简”：Base Camera (RGB): 只有一个顶视/侧视的全局相机。Wrist Camera: 数据集中没有录制（或者在转换成 LeRobot 格式时被丢弃了）。
+export XLA_PYTHON_CLIENT_ALLOCATOR=platform
+CUDA_VISIBLE_DEVICES=1 uv run scripts/train.py pi0_maniskill_pickcube --exp-name pi0_maniskill_lora --overwrite --wandb-enabled --batch-size 1 --model.paligemma-variant gemma_2b_lora
+
+6、分析训练效果
+6.1、训练日志片段
+完整日志见仓库中的 [training_log.txt](./training_log.txt)。
+**终端运行截图（展示了参数加载与早期 Loss 下降）：**
+![Training Terminal Output](./training_terminal_2.png)
+
+6.2、 训练效果截图
+训练过程已成功记录到 WandB 平台，下图展示了 Loss 下降曲线、Gradient Norm 变化以及训练过程中的图像数据（Camera Views）：
+
+**WandB 仪表盘截图：**
+![WandB Training Results](./wandb_results_2.png)
+
+6.3、 模型推理验证
+使用 `verify_model_2.py` 加载训练好的 Checkpoint，并对模型的输出进行推理验证：
+详细分析：
+1. 环境与配置加载
+JAX 初始化：你指定了 GPU 1，JAX 成功初始化。
+配置加载：pi0_maniskill_pickcube 配置被正确加载，并且 exp_name 被替换为 pi0_maniskill_lora。
+Checkpoint 路径：自动定位到了最新的 checkpoint（step 1999），说明训练过程和 checkpoint 保存都正常。
+2. Policy 加载
+Policy 加载成功：模型权重和结构都能被正确恢复，说明训练和保存流程没有问题。
+3. Output Transform 修复
+扫描 Policy 内部的 output_transform：你的脚本递归地查找并修正了所有 18 维的归一化参数（mean、std、q01、q99），将它们强制截断为 7 维。
+命中并修正：日志显示所有相关属性都被正确截断，这一步是解决之前 shape mismatch 报错的关键。
+4. 构造测试输入
+输入数据：你构造了全零的 128x128x3 图像和 7 维 state，模拟了一个最简单的观测输入。
+输入格式：与训练时的数据结构一致，能被模型正常接受。
+5. 推理与输出
+推理成功：模型顺利完成了前向推理，没有任何 shape 或归一化相关的报错。
+输出内容：
+actions：shape 为 (N, 7) 的数组（N 可能是时间步数或 batch），数值正常，非全零，说明模型有输出响应。
+state：输出了一个 7 维的状态数组，数值很小，符合输入为全零的情况。
+policy_timing：包含推理耗时（infer_ms），说明模型推理过程被正常计时。
+
+【小插曲】问题：归一化统计数据（mean/std）维度和模型输出维度不匹配。config 加载了 ManiSkill 的原始 norm_stats（18维），但模型输出是 7维（因为 SliceState(dim=7)）。在推理时，output_transform 试图用 18维的 mean/std 去反归一化 7维动作，导致报错。
+解决方案：在推理脚本里，手动把 norm_stats 的 mean/std 截断为 7维。扫描 Policy 内部的 output_transform：递归地查找并修正了所有 18 维的归一化参数（mean、std、q01、q99），将它们强制截断为 7 维。
+
+7、总结
+在显存受限条件下，采用 LoRA 微调与极小 Batch Size，模型依然表现出良好的收敛趋势。训练日志与 WandB 可视化结果显示 Loss 曲线平稳下降，模型能够输出合理的动作分布，验证了数据转换与训练流程的有效性。
